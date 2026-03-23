@@ -74,7 +74,25 @@ type HubEvent struct {
 func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 
-	// Verify signature
+	var event HubEvent
+	if err := json.Unmarshal(body, &event); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	// Handle URL verification (no signature required, like Slack)
+	if event.Type == "url_verification" {
+		var challenge struct {
+			Challenge string `json:"challenge"`
+		}
+		json.Unmarshal(body, &challenge)
+		slog.Info("url verification", "challenge", challenge.Challenge)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"challenge": challenge.Challenge})
+		return
+	}
+
+	// Verify signature for all other events
 	if cfg.SigningSecret != "" {
 		timestamp := r.Header.Get("X-Timestamp")
 		signature := r.Header.Get("X-Signature")
@@ -86,25 +104,8 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var event HubEvent
-	if err := json.Unmarshal(body, &event); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
-
 	slog.Info("received event", "type", event.Type, "event_type", event.Event.Type,
 		"trace_id", event.TraceID)
-
-	// Handle URL verification
-	if event.Type == "url_verification" {
-		var challenge struct {
-			Challenge string `json:"challenge"`
-		}
-		json.Unmarshal(body, &challenge)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"challenge": challenge.Challenge})
-		return
-	}
 
 	// Handle command
 	if event.Type == "command" {
