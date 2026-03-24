@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,36 +13,53 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
-// Config from environment variables.
 type Config struct {
-	Port         string // PORT, default 8081
-	HubURL       string // HUB_URL, e.g. https://hub.example.com
-	AppToken     string // HUB_APP_TOKEN (from installation)
-	SigningSecret string // HUB_SIGNING_SECRET (from installation)
+	Port        string
+	HubURL      string
+	DatabaseURL string
+	BaseURL     string // public URL of this app, e.g. https://echo.app.openilink.com
 }
 
-func loadConfig() Config {
-	cfg := Config{
-		Port:         os.Getenv("PORT"),
-		HubURL:       os.Getenv("HUB_URL"),
-		AppToken:     os.Getenv("HUB_APP_TOKEN"),
-		SigningSecret: os.Getenv("HUB_SIGNING_SECRET"),
-	}
-	if cfg.Port == "" {
-		cfg.Port = "8081"
-	}
-	return cfg
+type Installation struct {
+	ID            string
+	AppToken      string
+	SigningSecret string
+	BotID         string
+	Handle        string
 }
 
-var cfg Config
+var (
+	cfg Config
+	db  *sql.DB
+)
 
 func main() {
-	cfg = loadConfig()
+	cfg = Config{
+		Port:        envOr("PORT", "8081"),
+		HubURL:      os.Getenv("HUB_URL"),
+		DatabaseURL: os.Getenv("DATABASE_URL"),
+		BaseURL:     os.Getenv("BASE_URL"),
+	}
+
+	var err error
+	db, err = sql.Open("postgres", cfg.DatabaseURL)
+	if err != nil {
+		slog.Error("db open failed", "err", err)
+		os.Exit(1)
+	}
+	if err := migrate(); err != nil {
+		slog.Error("db migrate failed", "err", err)
+		os.Exit(1)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /hub/webhook", handleHubWebhook)
+	mux.HandleFunc("POST /callback", handleCallback)
+	mux.HandleFunc("GET /manifest.json", handleManifest)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
@@ -52,6 +70,66 @@ func main() {
 		slog.Error("server failed", "err", err)
 		os.Exit(1)
 	}
+}
+
+func migrate() error {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS installations (
+		id TEXT PRIMARY KEY,
+		app_token TEXT NOT NULL,
+		signing_secret TEXT NOT NULL,
+		bot_id TEXT NOT NULL,
+		handle TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	return err
+}
+
+// POST /callback — Hub notifies us after a user installs the app
+func handleCallback(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		InstallationID string `json:"installation_id"`
+		AppToken       string `json:"app_token"`
+		SigningSecret  string `json:"signing_secret"`
+		BotID          string `json:"bot_id"`
+		Handle         string `json:"handle"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	// Upsert installation
+	_, err := db.Exec(`INSERT INTO installations (id, app_token, signing_secret, bot_id, handle)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (id) DO UPDATE SET app_token=$2, signing_secret=$3, bot_id=$4, handle=$5`,
+		req.InstallationID, req.AppToken, req.SigningSecret, req.BotID, req.Handle)
+	if err != nil {
+		slog.Error("save installation failed", "err", err)
+		http.Error(w, "save failed", http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("installation saved", "id", req.InstallationID, "bot", req.BotID, "handle", req.Handle)
+
+	// Return our webhook URL so Hub auto-sets request_url
+	w.Header().Set("Content-Type", "application/json")
+	requestURL := cfg.BaseURL + "/hub/webhook"
+	json.NewEncoder(w).Encode(map[string]string{"request_url": requestURL})
+}
+
+// GET /manifest.json — App definition for Hub
+func handleManifest(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"slug":        "echo",
+		"name":        "Echo",
+		"description": "回显消息和命令的测试 App",
+		"icon":        "🔊",
+		"commands":    []map[string]string{{"name": "/echo", "description": "回显消息"}, {"name": "/echo-delay", "description": "5秒后回显"}, {"name": "/ping", "description": "pong"}},
+		"events":      []string{"message.text"},
+		"scopes":      []string{"messages.send"},
+		"redirect_url": cfg.BaseURL + "/callback",
+	})
 }
 
 // Hub event envelope
@@ -80,11 +158,9 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle URL verification (no signature required, like Slack)
+	// URL verification — no signature check
 	if event.Type == "url_verification" {
-		var challenge struct {
-			Challenge string `json:"challenge"`
-		}
+		var challenge struct{ Challenge string `json:"challenge"` }
 		json.Unmarshal(body, &challenge)
 		slog.Info("url verification", "challenge", challenge.Challenge)
 		w.Header().Set("Content-Type", "application/json")
@@ -92,133 +168,111 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify signature for all other events
-	if cfg.SigningSecret != "" {
-		timestamp := r.Header.Get("X-Timestamp")
-		signature := r.Header.Get("X-Signature")
-		expected := computeSignature(cfg.SigningSecret, timestamp, body)
-		if signature != "sha256="+expected {
-			slog.Warn("invalid signature", "expected", expected, "got", signature)
-			http.Error(w, "invalid signature", http.StatusUnauthorized)
-			return
-		}
+	// Look up installation for signature verification
+	inst := getInstallation(event.InstallationID)
+	if inst == nil {
+		slog.Warn("unknown installation", "id", event.InstallationID)
+		http.Error(w, "unknown installation", http.StatusUnauthorized)
+		return
+	}
+
+	// Verify signature
+	timestamp := r.Header.Get("X-Timestamp")
+	signature := r.Header.Get("X-Signature")
+	expected := computeSignature(inst.SigningSecret, timestamp, body)
+	if signature != "sha256="+expected {
+		slog.Warn("invalid signature", "installation", inst.ID)
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
+		return
 	}
 
 	slog.Info("received event", "type", event.Type, "event_type", event.Event.Type,
-		"trace_id", event.TraceID)
+		"installation", inst.ID, "trace_id", event.TraceID)
 
-	// Handle command
 	if event.Type == "command" {
-		handleCommand(w, event)
+		handleCommand(w, event, inst)
 		return
 	}
-
-	// Handle message event
 	if event.Event.Type != "" {
-		handleMessage(w, event)
+		handleMessage(w, event, inst)
 		return
 	}
-
 	w.WriteHeader(http.StatusOK)
 }
 
-func handleCommand(w http.ResponseWriter, event HubEvent) {
+func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 	data := event.Event.Data
 	command, _ := data["command"].(string)
 	text, _ := data["text"].(string)
 	sender, _ := data["sender"].(map[string]any)
 	senderID, _ := sender["id"].(string)
 
-	slog.Info("command received", "command", command, "text", text, "sender", senderID)
+	slog.Info("command", "cmd", command, "text", text, "sender", senderID, "handle", inst.Handle)
 
 	switch command {
 	case "/echo":
 		if text == "" {
 			text = "(empty)"
 		}
-		// Sync reply
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"reply": fmt.Sprintf("Echo: %s", text),
-		})
+		jsonReply(w, fmt.Sprintf("Echo: %s", text))
 
 	case "/echo-delay":
-		// Async reply after 5 seconds via Bot API
 		go func() {
 			time.Sleep(5 * time.Second)
-			err := sendMessage(senderID, fmt.Sprintf("Delayed echo (5s): %s", text), event.TraceID)
-			if err != nil {
+			if err := sendMessage(inst, senderID, fmt.Sprintf("Delayed echo (5s): %s", text), event.TraceID); err != nil {
 				slog.Error("delayed send failed", "err", err)
 			}
 		}()
-		// Immediate ack
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"reply": "收到，5 秒后回复...",
-		})
+		jsonReply(w, "收到，5 秒后回复...")
 
 	case "/ping":
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"reply": "pong!",
-		})
+		jsonReply(w, "pong!")
 
 	default:
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"reply": fmt.Sprintf("未知命令: %s\n支持: /echo, /echo-delay, /ping", command),
-		})
+		jsonReply(w, fmt.Sprintf("未知命令: %s\n支持: /echo, /echo-delay, /ping", command))
 	}
 }
 
-func handleMessage(w http.ResponseWriter, event HubEvent) {
+func handleMessage(w http.ResponseWriter, event HubEvent, inst *Installation) {
 	data := event.Event.Data
 	content, _ := data["content"].(string)
-	sender, _ := data["sender"].(map[string]any)
-	senderID, _ := sender["id"].(string)
-
-	slog.Info("message received", "type", event.Event.Type, "content", content, "sender", senderID)
-
-	// Echo back the message
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"reply": fmt.Sprintf("Echo: %s", content),
-	})
+	jsonReply(w, fmt.Sprintf("Echo: %s", content))
 }
 
-// sendMessage calls Hub Bot API to send a message.
-func sendMessage(to, content, traceID string) error {
-	if cfg.HubURL == "" || cfg.AppToken == "" {
-		return fmt.Errorf("hub not configured")
-	}
+func jsonReply(w http.ResponseWriter, text string) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"reply": text})
+}
 
+// sendMessage calls Hub Bot API using the installation's token.
+func sendMessage(inst *Installation, to, content, traceID string) error {
 	payload, _ := json.Marshal(map[string]string{
-		"to":       to,
-		"type":     "text",
-		"content":  content,
-		"trace_id": traceID,
+		"to": to, "type": "text", "content": content, "trace_id": traceID,
 	})
-
 	req, _ := http.NewRequest("POST", cfg.HubURL+"/bot/v1/messages/send", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.AppToken)
-	if traceID != "" {
-		req.Header.Set("X-Trace-Id", traceID)
-	}
+	req.Header.Set("Authorization", "Bearer "+inst.AppToken)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("hub api error: %d %s", resp.StatusCode, string(body))
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("hub api: %d %s", resp.StatusCode, string(b))
 	}
-
-	slog.Info("message sent via hub api", "to", to, "trace_id", traceID)
 	return nil
+}
+
+func getInstallation(id string) *Installation {
+	inst := &Installation{}
+	err := db.QueryRow("SELECT id, app_token, signing_secret, bot_id, handle FROM installations WHERE id=$1", id).
+		Scan(&inst.ID, &inst.AppToken, &inst.SigningSecret, &inst.BotID, &inst.Handle)
+	if err != nil {
+		return nil
+	}
+	return inst
 }
 
 func computeSignature(secret, timestamp string, body []byte) string {
@@ -226,4 +280,11 @@ func computeSignature(secret, timestamp string, body []byte) string {
 	mac.Write([]byte(timestamp + ":"))
 	mac.Write(body)
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
