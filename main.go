@@ -125,7 +125,21 @@ func handleManifest(w http.ResponseWriter, r *http.Request) {
 		"name":        "Echo",
 		"description": "回显消息和命令的测试 App",
 		"icon":        "🔊",
-		"commands":    []map[string]string{{"name": "/echo", "description": "回显消息"}, {"name": "/echo-delay", "description": "5秒后回显"}, {"name": "/ping", "description": "pong"}},
+		"tools": []map[string]any{
+			{"name": "echo", "description": "回显消息", "command": "echo", "parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"text": map[string]string{"type": "string", "description": "要回显的文本"},
+				},
+			}},
+			{"name": "echo_delay", "description": "5秒后回显", "command": "echo-delay", "parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"text": map[string]string{"type": "string", "description": "要回显的文本"},
+				},
+			}},
+			{"name": "ping", "description": "检查服务是否存活", "command": "ping"},
+		},
 		"events":      []string{"message.text"},
 		"scopes":      []string{"messages.send"},
 		"redirect_url": cfg.BaseURL + "/callback",
@@ -189,11 +203,11 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 	slog.Info("received event", "type", event.Type, "event_type", event.Event.Type,
 		"installation", inst.ID, "trace_id", event.TraceID)
 
-	if event.Type == "command" {
+	switch event.Event.Type {
+	case "command":
 		handleCommand(w, event, inst)
 		return
-	}
-	if event.Event.Type != "" {
+	case "message.text", "message.image", "message.voice", "message.video", "message.file":
 		handleMessage(w, event, inst)
 		return
 	}
@@ -204,28 +218,42 @@ func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 	data := event.Event.Data
 	command, _ := data["command"].(string)
 	text, _ := data["text"].(string)
+	args, _ := data["args"].(map[string]any)
 	sender, _ := data["sender"].(map[string]any)
 	senderID, _ := sender["id"].(string)
 
-	slog.Info("command", "cmd", command, "text", text, "sender", senderID, "handle", inst.Handle)
+	slog.Info("command", "cmd", command, "text", text, "args", args,
+		"sender", senderID, "trace_id", event.TraceID)
+
+	// Helper: resolve a param from structured args first, then free-form text
+	resolveText := func() string {
+		if args != nil {
+			if v, ok := args["text"].(string); ok && v != "" {
+				return v
+			}
+		}
+		return text
+	}
 
 	switch command {
-	case "/echo":
-		if text == "" {
-			text = "(empty)"
+	case "echo":
+		t := resolveText()
+		if t == "" {
+			t = "(empty)"
 		}
-		jsonReply(w, fmt.Sprintf("Echo: %s", text))
+		jsonReply(w, fmt.Sprintf("Echo: %s", t))
 
-	case "/echo-delay":
+	case "echo-delay":
+		t := resolveText()
 		go func() {
 			time.Sleep(5 * time.Second)
-			if err := sendMessage(inst, senderID, fmt.Sprintf("Delayed echo (5s): %s", text), event.TraceID); err != nil {
-				slog.Error("delayed send failed", "err", err)
+			if err := sendMessage(inst, senderID, fmt.Sprintf("Delayed echo (5s): %s", t), event.TraceID); err != nil {
+				slog.Error("delayed send failed", "err", err, "trace_id", event.TraceID)
 			}
 		}()
 		jsonReply(w, "收到，5 秒后回复...")
 
-	case "/ping":
+	case "ping":
 		jsonReply(w, "pong!")
 
 	default:
@@ -252,6 +280,9 @@ func sendMessage(inst *Installation, to, content, traceID string) error {
 	req, _ := http.NewRequest("POST", cfg.HubURL+"/bot/v1/messages/send", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+inst.AppToken)
+	if traceID != "" {
+		req.Header.Set("X-Trace-Id", traceID)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
