@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -22,19 +25,23 @@ type Config struct {
 	HubURL      string
 	DatabaseURL string
 	BaseURL     string // public URL of this app, e.g. https://echo.app.openilink.com
+	AppID       string // app ID on the Hub, for OAuth exchange
 }
 
 type Installation struct {
 	ID            string
 	AppToken      string
-	SigningSecret string
+	WebhookSecret string
 	BotID         string
-	Handle        string
 }
 
 var (
 	cfg Config
 	db  *sql.DB
+
+	// PKCE: temporary storage for code_verifier keyed by state
+	pkceMu       sync.Mutex
+	pkceVerifiers = map[string]string{} // state -> code_verifier
 )
 
 func main() {
@@ -43,6 +50,7 @@ func main() {
 		HubURL:      os.Getenv("HUB_URL"),
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 		BaseURL:     os.Getenv("BASE_URL"),
+		AppID:       os.Getenv("APP_ID"),
 	}
 
 	var err error
@@ -58,7 +66,8 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /hub/webhook", handleHubWebhook)
-	mux.HandleFunc("POST /callback", handleCallback)
+	mux.HandleFunc("GET /oauth/setup", handleOAuthSetup)
+	mux.HandleFunc("GET /oauth/redirect", handleOAuthRedirect)
 	mux.HandleFunc("GET /manifest.json", handleManifest)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
@@ -76,45 +85,122 @@ func migrate() error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS installations (
 		id TEXT PRIMARY KEY,
 		app_token TEXT NOT NULL,
-		signing_secret TEXT NOT NULL,
+		webhook_secret TEXT NOT NULL,
 		bot_id TEXT NOT NULL,
-		handle TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`)
 	return err
 }
 
-// POST /callback — Hub notifies us after a user installs the app
-func handleCallback(w http.ResponseWriter, r *http.Request) {
-	var req struct {
+// GET /oauth/setup — Hub redirects user here to start installation
+// Query params: hub, app_id, bot_id, state
+func handleOAuthSetup(w http.ResponseWriter, r *http.Request) {
+	hubURL := r.URL.Query().Get("hub")
+	appID := r.URL.Query().Get("app_id")
+	botID := r.URL.Query().Get("bot_id")
+	state := r.URL.Query().Get("state")
+
+	if hubURL == "" || appID == "" || botID == "" || state == "" {
+		http.Error(w, "missing required params", http.StatusBadRequest)
+		return
+	}
+
+	// Generate PKCE code_verifier and code_challenge
+	verifier := generateCodeVerifier()
+	challenge := computeCodeChallenge(verifier)
+
+	// Store verifier keyed by state
+	pkceMu.Lock()
+	pkceVerifiers[state] = verifier
+	pkceMu.Unlock()
+
+	// Clean up after 10 minutes
+	go func() {
+		time.Sleep(10 * time.Minute)
+		pkceMu.Lock()
+		delete(pkceVerifiers, state)
+		pkceMu.Unlock()
+	}()
+
+	// Redirect to Hub's authorize endpoint
+	authorizeURL := fmt.Sprintf("%s/api/apps/%s/oauth/authorize?bot_id=%s&state=%s&code_challenge=%s",
+		hubURL, appID, botID, state, challenge)
+
+	slog.Info("oauth setup", "app_id", appID, "bot_id", botID, "state", state)
+	http.Redirect(w, r, authorizeURL, http.StatusFound)
+}
+
+// GET /oauth/redirect — Hub redirects back here after user authorizes
+// Query params: code, state
+func handleOAuthRedirect(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	state := r.URL.Query().Get("state")
+
+	if code == "" || state == "" {
+		http.Error(w, "missing code or state", http.StatusBadRequest)
+		return
+	}
+
+	// Retrieve and remove code_verifier
+	pkceMu.Lock()
+	verifier, ok := pkceVerifiers[state]
+	delete(pkceVerifiers, state)
+	pkceMu.Unlock()
+
+	if !ok {
+		http.Error(w, "unknown or expired state", http.StatusBadRequest)
+		return
+	}
+
+	// Exchange code for credentials
+	// We need the hub URL and app_id — derive from HUB_URL config
+	exchangeURL := cfg.HubURL + "/api/apps/" + cfg.AppID + "/oauth/exchange"
+	payload, _ := json.Marshal(map[string]string{
+		"code":          code,
+		"code_verifier": verifier,
+	})
+
+	resp, err := http.Post(exchangeURL, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		slog.Error("oauth exchange failed", "err", err)
+		http.Error(w, "exchange failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		slog.Error("oauth exchange error", "status", resp.StatusCode, "body", string(b))
+		http.Error(w, "exchange failed", http.StatusBadGateway)
+		return
+	}
+
+	var creds struct {
 		InstallationID string `json:"installation_id"`
 		AppToken       string `json:"app_token"`
-		SigningSecret  string `json:"signing_secret"`
+		WebhookSecret  string `json:"webhook_secret"`
 		BotID          string `json:"bot_id"`
-		Handle         string `json:"handle"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := json.NewDecoder(resp.Body).Decode(&creds); err != nil {
+		slog.Error("oauth exchange decode failed", "err", err)
+		http.Error(w, "invalid exchange response", http.StatusBadGateway)
 		return
 	}
 
 	// Upsert installation
-	_, err := db.Exec(`INSERT INTO installations (id, app_token, signing_secret, bot_id, handle)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (id) DO UPDATE SET app_token=$2, signing_secret=$3, bot_id=$4, handle=$5`,
-		req.InstallationID, req.AppToken, req.SigningSecret, req.BotID, req.Handle)
+	_, err = db.Exec(`INSERT INTO installations (id, app_token, webhook_secret, bot_id)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (id) DO UPDATE SET app_token=$2, webhook_secret=$3, bot_id=$4`,
+		creds.InstallationID, creds.AppToken, creds.WebhookSecret, creds.BotID)
 	if err != nil {
 		slog.Error("save installation failed", "err", err)
 		http.Error(w, "save failed", http.StatusInternalServerError)
 		return
 	}
 
-	slog.Info("installation saved", "id", req.InstallationID, "bot", req.BotID, "handle", req.Handle)
+	slog.Info("installation saved via oauth", "id", creds.InstallationID, "bot", creds.BotID)
 
-	// Return our webhook URL so Hub auto-sets request_url
-	w.Header().Set("Content-Type", "application/json")
-	requestURL := cfg.BaseURL + "/hub/webhook"
-	json.NewEncoder(w).Encode(map[string]string{"request_url": requestURL})
+	fmt.Fprintf(w, "Echo App installed successfully! You can close this page.")
 }
 
 // GET /manifest.json — App definition for Hub
@@ -141,8 +227,10 @@ func handleManifest(w http.ResponseWriter, r *http.Request) {
 			{"name": "ping", "description": "检查服务是否存活", "command": "ping"},
 		},
 		"events":      []string{"message.text"},
-		"scopes":      []string{"messages.send"},
-		"redirect_url": cfg.BaseURL + "/callback",
+		"scopes":      []string{"message:write", "message:read"},
+		"oauth_setup_url":    cfg.BaseURL + "/oauth/setup",
+		"oauth_redirect_url": cfg.BaseURL + "/oauth/redirect",
+		"webhook_url":        cfg.BaseURL + "/hub/webhook",
 	})
 }
 
@@ -193,7 +281,7 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 	// Verify signature
 	timestamp := r.Header.Get("X-Timestamp")
 	signature := r.Header.Get("X-Signature")
-	expected := computeSignature(inst.SigningSecret, timestamp, body)
+	expected := computeSignature(inst.WebhookSecret, timestamp, body)
 	if signature != "sha256="+expected {
 		slog.Warn("invalid signature", "installation", inst.ID)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
@@ -277,7 +365,7 @@ func sendMessage(inst *Installation, to, content, traceID string) error {
 	payload, _ := json.Marshal(map[string]string{
 		"to": to, "type": "text", "content": content, "trace_id": traceID,
 	})
-	req, _ := http.NewRequest("POST", cfg.HubURL+"/bot/v1/messages/send", bytes.NewReader(payload))
+	req, _ := http.NewRequest("POST", cfg.HubURL+"/bot/v1/message/send", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+inst.AppToken)
 	if traceID != "" {
@@ -298,8 +386,8 @@ func sendMessage(inst *Installation, to, content, traceID string) error {
 
 func getInstallation(id string) *Installation {
 	inst := &Installation{}
-	err := db.QueryRow("SELECT id, app_token, signing_secret, bot_id, handle FROM installations WHERE id=$1", id).
-		Scan(&inst.ID, &inst.AppToken, &inst.SigningSecret, &inst.BotID, &inst.Handle)
+	err := db.QueryRow("SELECT id, app_token, webhook_secret, bot_id FROM installations WHERE id=$1", id).
+		Scan(&inst.ID, &inst.AppToken, &inst.WebhookSecret, &inst.BotID)
 	if err != nil {
 		return nil
 	}
@@ -318,4 +406,17 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// PKCE helpers
+
+func generateCodeVerifier() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func computeCodeChallenge(verifier string) string {
+	h := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(h[:])
 }
