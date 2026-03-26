@@ -7,7 +7,6 @@ services:
       PORT: "8081"
       HUB_URL: "https://hub.openilink.com"
       BASE_URL: "https://echo.app.openilink.com"
-      APP_ID: "${APP_ID}"
       DB_PATH: "/data/echo.db"
     volumes:
       - echo-data:/data

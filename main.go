@@ -21,11 +21,10 @@ import (
 )
 
 type Config struct {
-	Port   string
-	HubURL string
-	DBPath string // SQLite database file path
+	Port    string
+	HubURL  string
+	DBPath  string // SQLite database file path
 	BaseURL string // public URL of this app, e.g. https://echo.app.openilink.com
-	AppID   string // app ID on the Hub, for OAuth exchange
 }
 
 type Installation struct {
@@ -35,13 +34,19 @@ type Installation struct {
 	BotID         string
 }
 
+type pkceState struct {
+	Verifier string
+	HubURL   string
+	AppID    string
+}
+
 var (
 	cfg Config
 	db  *sql.DB
 
-	// PKCE: temporary storage for code_verifier keyed by state
-	pkceMu       sync.Mutex
-	pkceVerifiers = map[string]string{} // state -> code_verifier
+	// PKCE: temporary storage keyed by state
+	pkceMu     sync.Mutex
+	pkceStates = map[string]pkceState{}
 )
 
 func main() {
@@ -50,7 +55,6 @@ func main() {
 		HubURL:  os.Getenv("HUB_URL"),
 		DBPath:  envOr("DB_PATH", "data/echo.db"),
 		BaseURL: os.Getenv("BASE_URL"),
-		AppID:   os.Getenv("APP_ID"),
 	}
 
 	var err error
@@ -109,16 +113,16 @@ func handleOAuthSetup(w http.ResponseWriter, r *http.Request) {
 	verifier := generateCodeVerifier()
 	challenge := computeCodeChallenge(verifier)
 
-	// Store verifier keyed by state
+	// Store verifier and context keyed by state
 	pkceMu.Lock()
-	pkceVerifiers[state] = verifier
+	pkceStates[state] = pkceState{Verifier: verifier, HubURL: hubURL, AppID: appID}
 	pkceMu.Unlock()
 
 	// Clean up after 10 minutes
 	go func() {
 		time.Sleep(10 * time.Minute)
 		pkceMu.Lock()
-		delete(pkceVerifiers, state)
+		delete(pkceStates, state)
 		pkceMu.Unlock()
 	}()
 
@@ -141,10 +145,10 @@ func handleOAuthRedirect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Retrieve and remove code_verifier
+	// Retrieve and remove PKCE state
 	pkceMu.Lock()
-	verifier, ok := pkceVerifiers[state]
-	delete(pkceVerifiers, state)
+	ps, ok := pkceStates[state]
+	delete(pkceStates, state)
 	pkceMu.Unlock()
 
 	if !ok {
@@ -153,11 +157,10 @@ func handleOAuthRedirect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Exchange code for credentials
-	// We need the hub URL and app_id — derive from HUB_URL config
-	exchangeURL := cfg.HubURL + "/api/apps/" + cfg.AppID + "/oauth/exchange"
+	exchangeURL := ps.HubURL + "/api/apps/" + ps.AppID + "/oauth/exchange"
 	payload, _ := json.Marshal(map[string]string{
 		"code":          code,
-		"code_verifier": verifier,
+		"code_verifier": ps.Verifier,
 	})
 
 	resp, err := http.Post(exchangeURL, "application/json", bytes.NewReader(payload))
