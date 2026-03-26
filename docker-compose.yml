@@ -6,7 +6,8 @@ services:
     environment:
       PORT: "8081"
       HUB_URL: "https://hub.openilink.com"
-      BASE_URL: "http://openilink-app-echo:8081"
+      BASE_URL: "https://echo.app.openilink.com"
+      APP_ID: "${APP_ID}"
       DATABASE_URL: "postgres://openilink:${PG_PASS}@openilink-postgres:5432/openilink?sslmode=disable"
     labels:
       - traefik.enable=true
