@@ -17,15 +17,15 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/lib/pq"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type Config struct {
-	Port        string
-	HubURL      string
-	DatabaseURL string
-	BaseURL     string // public URL of this app, e.g. https://echo.app.openilink.com
-	AppID       string // app ID on the Hub, for OAuth exchange
+	Port   string
+	HubURL string
+	DBPath string // SQLite database file path
+	BaseURL string // public URL of this app, e.g. https://echo.app.openilink.com
+	AppID   string // app ID on the Hub, for OAuth exchange
 }
 
 type Installation struct {
@@ -46,15 +46,15 @@ var (
 
 func main() {
 	cfg = Config{
-		Port:        envOr("PORT", "8081"),
-		HubURL:      os.Getenv("HUB_URL"),
-		DatabaseURL: os.Getenv("DATABASE_URL"),
-		BaseURL:     os.Getenv("BASE_URL"),
-		AppID:       os.Getenv("APP_ID"),
+		Port:    envOr("PORT", "8081"),
+		HubURL:  os.Getenv("HUB_URL"),
+		DBPath:  envOr("DB_PATH", "data/echo.db"),
+		BaseURL: os.Getenv("BASE_URL"),
+		AppID:   os.Getenv("APP_ID"),
 	}
 
 	var err error
-	db, err = sql.Open("postgres", cfg.DatabaseURL)
+	db, err = sql.Open("sqlite3", cfg.DBPath)
 	if err != nil {
 		slog.Error("db open failed", "err", err)
 		os.Exit(1)
@@ -87,7 +87,7 @@ func migrate() error {
 		app_token TEXT NOT NULL,
 		webhook_secret TEXT NOT NULL,
 		bot_id TEXT NOT NULL,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		created_at TEXT NOT NULL DEFAULT (datetime('now'))
 	)`)
 	return err
 }
@@ -189,8 +189,8 @@ func handleOAuthRedirect(w http.ResponseWriter, r *http.Request) {
 
 	// Upsert installation
 	_, err = db.Exec(`INSERT INTO installations (id, app_token, webhook_secret, bot_id)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (id) DO UPDATE SET app_token=$2, webhook_secret=$3, bot_id=$4`,
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET app_token=excluded.app_token, webhook_secret=excluded.webhook_secret, bot_id=excluded.bot_id`,
 		creds.InstallationID, creds.AppToken, creds.WebhookSecret, creds.BotID)
 	if err != nil {
 		slog.Error("save installation failed", "err", err)
@@ -386,7 +386,7 @@ func sendMessage(inst *Installation, to, content, traceID string) error {
 
 func getInstallation(id string) *Installation {
 	inst := &Installation{}
-	err := db.QueryRow("SELECT id, app_token, webhook_secret, bot_id FROM installations WHERE id=$1", id).
+	err := db.QueryRow("SELECT id, app_token, webhook_secret, bot_id FROM installations WHERE id=?", id).
 		Scan(&inst.ID, &inst.AppToken, &inst.WebhookSecret, &inst.BotID)
 	if err != nil {
 		return nil
