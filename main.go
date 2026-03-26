@@ -35,9 +35,10 @@ type Installation struct {
 }
 
 type pkceState struct {
-	Verifier string
-	HubURL   string
-	AppID    string
+	Verifier  string
+	HubURL    string
+	AppID     string
+	ReturnURL string
 }
 
 var (
@@ -103,6 +104,7 @@ func handleOAuthSetup(w http.ResponseWriter, r *http.Request) {
 	appID := r.URL.Query().Get("app_id")
 	botID := r.URL.Query().Get("bot_id")
 	state := r.URL.Query().Get("state")
+	returnURL := r.URL.Query().Get("return_url")
 
 	if hubURL == "" || appID == "" || botID == "" || state == "" {
 		http.Error(w, "missing required params", http.StatusBadRequest)
@@ -115,7 +117,7 @@ func handleOAuthSetup(w http.ResponseWriter, r *http.Request) {
 
 	// Store verifier and context keyed by state
 	pkceMu.Lock()
-	pkceStates[state] = pkceState{Verifier: verifier, HubURL: hubURL, AppID: appID}
+	pkceStates[state] = pkceState{Verifier: verifier, HubURL: hubURL, AppID: appID, ReturnURL: returnURL}
 	pkceMu.Unlock()
 
 	// Clean up after 10 minutes
@@ -203,6 +205,11 @@ func handleOAuthRedirect(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("installation saved via oauth", "id", creds.InstallationID, "bot", creds.BotID)
 
+	// Redirect to return_url to close the popup and return user to Hub
+	if ps.ReturnURL != "" {
+		http.Redirect(w, r, ps.ReturnURL, http.StatusFound)
+		return
+	}
 	fmt.Fprintf(w, "Echo App installed successfully! You can close this page.")
 }
 
